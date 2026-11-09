@@ -30,7 +30,7 @@ jobs:
 
       - name: APK 파일 빌드
         run: |
-          flet build apk --project-name "voicediary"
+          flet build apk --yes
 
       - name: 생성된 APK 파일 업로드
         uses: actions/upload-artifact@v4
