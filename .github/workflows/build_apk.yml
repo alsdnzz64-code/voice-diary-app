@@ -1,0 +1,35 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Flutter 환경 설정
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Python 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Flet 빌드 도구 설치
+        run: |
+          pip install flet
+
+      - name: APK 파일 빌드
+        run: |
+          flet build apk --project-name "voicediary"
+
+      - name: 생성된 APK 파일 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-diary-apk
+          path: build/apk/*.apk
