@@ -5,7 +5,13 @@ import re
 import sqlite3
 import flet as ft
 
-DB_FILE = "diary_entries.db"
+# 안드로이드 앱 내부 쓰기 가능 경로 설정 (Flet 1.0 호환)
+DATA_DIR = os.environ.get("FLET_APP_STORAGE_DATA") or os.path.expanduser("~")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    DB_FILE = os.path.join(DATA_DIR, "diary_entries.db")
+except Exception:
+    DB_FILE = "diary_entries.db"
 
 # 키워드 추출 시 제외할 불용어 목록
 STOPWORDS = {
@@ -36,6 +42,23 @@ def init_db():
             """
         )
         conn.commit()
+
+
+def load_all_entries() -> list[dict]:
+    """DB에서 전체 일기 목록을 날짜 최신순으로 조회"""
+    entries = []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, date, weather, keywords, raw_speech, diary, photo_path, bgm_name FROM diaries ORDER BY date DESC, id DESC"
+            )
+            for row in cur.fetchall():
+                entries.append(dict(row))
+    except Exception:
+        pass
+    return entries
 
 
 def extract_keywords(text: str, max_keywords: int = 3) -> str:
@@ -97,348 +120,612 @@ def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 16
     page.bgcolor = "#F4EFEA"
+    page.scroll = ft.ScrollMode.AUTO
 
     init_db()
 
-    # 상태 관리
     today_str = datetime.date.today().strftime("%Y.%m.%d")
-    current_date = ft.Ref[ft.TextField]()
-    current_weather = ft.Ref[ft.Dropdown]()
-    current_keywords = ft.Ref[ft.TextField]()
-    raw_input = ft.Ref[ft.TextField]()
-    diary_input = ft.Ref[ft.TextField]()
-    photo_path = ft.Ref[ft.Text]()
-    photo_image = ft.Ref[ft.Image]()
-    bgm_title = ft.Ref[ft.Text]()
+
+    # 상태 컨트롤 생성 (Flet 1.0 호환)
+    status_banner = ft.Text(
+        "오늘 있었던 일을 기록해 보세요",
+        size=12,
+        color="#8D6E63",
+        weight=ft.FontWeight.W_500,
+    )
+    date_field = ft.TextField(
+        label="날짜",
+        value=today_str,
+        width=135,
+        dense=True,
+        bgcolor="#FFFDF9",
+    )
+    weather_dropdown = ft.Dropdown(
+        label="날씨",
+        value="☀️ 맑음",
+        options=[
+            ft.DropdownOption(key="☀️ 맑음", text="☀️ 맑음"),
+            ft.DropdownOption(key="⛅ 구름", text="⛅ 구름"),
+            ft.DropdownOption(key="☁️ 흐림", text="☁️ 흐림"),
+            ft.DropdownOption(key="🌧️ 비", text="🌧️ 비"),
+            ft.DropdownOption(key="❄️ 눈", text="❄️ 눈"),
+            ft.DropdownOption(key="🌙 밤", text="🌙 밤"),
+        ],
+        width=120,
+        dense=True,
+    )
+    keywords_field = ft.TextField(
+        label="핵심 키워드 (캘린더/목록에 표시)",
+        hint_text="자동 추출 또는 직접 입력",
+        dense=True,
+        bgcolor="#FFFDF9",
+    )
+    raw_field = ft.TextField(
+        hint_text="오늘 있었던 일을 편하게 적어보세요 (키보드 마이크 버튼으로도 음성 입력 가능)...",
+        multiline=True,
+        min_lines=3,
+        max_lines=4,
+        bgcolor="#FFFDF9",
+    )
+    diary_field = ft.TextField(
+        multiline=True,
+        min_lines=6,
+        max_lines=10,
+        bgcolor="#FDFBF7",
+    )
+
+    current_photo_path = {"value": ""}
+    photo_preview = ft.Image(
+        src="",
+        width=220,
+        height=150,
+        visible=False,
+        border_radius=ft.BorderRadius.all(8),
+    )
+    photo_name_text = ft.Text("첨부된 사진 없음", size=12, color="#8C7A6B")
+    bgm_title_text = ft.Text("선곡된 BGM 없음", size=12, color="#8C7A6B")
+
+    saved_list_column = ft.Column(spacing=6)
+
+    # Flet 1.0 FilePicker 서비스 인스턴스 유지
+    file_picker = ft.FilePicker()
 
     # 캘린더 상태
-    cal_year = datetime.date.today().year
-    cal_month = datetime.date.today().month
-    cal_title = ft.Text(f"{cal_year}년 {cal_month}월", size=18, weight=ft.FontWeight.BOLD, color="#3C2F2F")
+    cal_state = {
+        "year": datetime.date.today().year,
+        "month": datetime.date.today().month,
+    }
+    cal_title = ft.Text(
+        f"{cal_state['year']}년 {cal_state['month']}월",
+        size=18,
+        weight=ft.FontWeight.BOLD,
+        color="#3C2F2F",
+    )
     cal_grid_column = ft.Column(spacing=4)
 
-    # 알림 스낵바
-    def show_msg(text: str):
-        page.overlay.append(ft.SnackBar(ft.Text(text), open=True))
+    def show_msg(msg: str):
+        status_banner.value = msg
+        try:
+            page.show_dialog(ft.SnackBar(content=ft.Text(msg)))
+        except Exception:
+            pass
         page.update()
 
-    # 사진 파일 피커
-    def on_photo_result(e: ft.FilePickerResultEvent):
-        if e.files:
-            selected_path = e.files[0].path
-            photo_path.current.value = selected_path
-            photo_image.current.src = selected_path
-            photo_image.current.visible = True
-            show_msg("사진이 첨부되었습니다 📷")
-            page.update()
+    # 사진 선택 (Flet 1.0 비동기 서비스 방식)
+    async def pick_photo(e):
+        try:
+            files = await file_picker.pick_files(allow_multiple=False)
+            if files and len(files) > 0:
+                f = files[0]
+                if f.path:
+                    current_photo_path["value"] = f.path
+                    photo_preview.src = f.path
+                    photo_preview.visible = True
+                photo_name_text.value = f"📷 {f.name}"
+                show_msg(f"사진 첨부 완료: {f.name}")
+        except Exception as ex:
+            show_msg(f"사진 선택 안내: {ex}")
 
-    file_picker = ft.FilePicker(on_result=on_photo_result)
-    page.overlay.append(file_picker)
+    def clear_photo(e):
+        current_photo_path["value"] = ""
+        photo_preview.visible = False
+        photo_name_text.value = "첨부된 사진 없음"
+        page.update()
 
-    # BGM 파일 피커
-    def on_bgm_result(e: ft.FilePickerResultEvent):
-        if e.files:
-            bgm_title.current.value = f"🎶 {e.files[0].name}"
-            show_msg(f"BGM 선곡: {e.files[0].name}")
-            page.update()
+    # BGM 선택 (Flet 1.0 비동기 서비스 방식)
+    async def pick_bgm(e):
+        try:
+            files = await file_picker.pick_files(allow_multiple=False)
+            if files and len(files) > 0:
+                bgm_title_text.value = f"🎶 {files[0].name}"
+                show_msg(f"BGM 선곡 완료: {files[0].name}")
+        except Exception as ex:
+            show_msg(f"음원 선택 안내: {ex}")
 
-    bgm_picker = ft.FilePicker(on_result=on_bgm_result)
-    page.overlay.append(bgm_picker)
-
-    # 일기 생성 로직
+    # 일기 생성 버튼
     def generate_diary(e):
-        text = raw_input.current.value.strip()
+        text = (raw_field.value or "").strip()
         if not text:
-            show_msg("먼저 오늘 있었던 일을 입력하거나 말해주세요!")
+            show_msg("먼저 오늘 있었던 일을 입력해 주세요!")
             return
         kw = extract_keywords(text)
-        current_keywords.current.value = kw
+        keywords_field.value = kw
         polished = polish_spoken_to_diary(text)
+        w_val = weather_dropdown.value or "☀️ 맑음"
         diary_template = (
-            f"날짜: {current_date.current.value}   |   날씨: {current_weather.current.value}\n"
+            f"날짜: {date_field.value}   |   날씨: {w_val}\n"
             f"키워드: {kw}\n"
-            f"{'─' * 38}\n\n"
+            f"{'─' * 34}\n\n"
             f"{polished}\n"
         )
-        diary_input.current.value = diary_template
-        show_msg("일기가 생성되었습니다! 상단 '저장하기'를 눌러주세요.")
-        page.update()
+        diary_field.value = diary_template
+        show_msg("일기가 생성되었습니다! 상단 [💾 일기 저장]을 눌러주세요.")
 
-    # DB 저장 로직
+    # 새 일기 폼 초기화
+    def reset_form(e=None):
+        date_field.value = datetime.date.today().strftime("%Y.%m.%d")
+        weather_dropdown.value = "☀️ 맑음"
+        keywords_field.value = ""
+        raw_field.value = ""
+        diary_field.value = ""
+        current_photo_path["value"] = ""
+        photo_preview.visible = False
+        photo_name_text.value = "첨부된 사진 없음"
+        bgm_title_text.value = "선곡된 BGM 없음"
+        show_msg("새 일기 작성 화면입니다")
+
+    # 특정 일기 데이터를 폼에 불러오기
+    def load_entry_into_form(item: dict):
+        date_field.value = item.get("date", today_str)
+        weather_dropdown.value = item.get("weather") or "☀️ 맑음"
+        keywords_field.value = item.get("keywords") or ""
+        raw_field.value = item.get("raw_speech") or ""
+        diary_field.value = item.get("diary") or ""
+        p_path = item.get("photo_path") or ""
+        current_photo_path["value"] = p_path
+        if p_path and os.path.exists(p_path):
+            photo_preview.src = p_path
+            photo_preview.visible = True
+            photo_name_text.value = f"📷 {os.path.basename(p_path)}"
+        else:
+            photo_preview.visible = False
+            photo_name_text.value = "첨부된 사진 없음"
+        bgm_title_text.value = item.get("bgm_name") or "선곡된 BGM 없음"
+        switch_to_diary()
+        show_msg(f"'{item.get('date')}' 일기를 불러왔습니다")
+
+    # 특정 날짜 일기 삭제
+    def delete_entry_by_date(target_date: str):
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM diaries WHERE date = ?", (target_date,))
+                conn.commit()
+            refresh_saved_list()
+            render_calendar()
+            show_msg(f"'{target_date}' 일기가 삭제되었습니다")
+        except Exception as ex:
+            show_msg(f"삭제 오류: {ex}")
+
+    # 하단 저장된 일기 목록 갱신
+    def refresh_saved_list():
+        saved_list_column.controls.clear()
+        entries = load_all_entries()
+        if not entries:
+            saved_list_column.controls.append(
+                ft.Text("아직 저장된 일기가 없습니다.", size=12, color="#8C7A6B")
+            )
+            return
+
+        for item in entries:
+            d_str = item["date"]
+            kw_str = item.get("keywords") or extract_keywords(item.get("diary", ""))
+            row_card = ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    f"{d_str}  |  {kw_str}",
+                                    size=13,
+                                    weight=ft.FontWeight.BOLD,
+                                    color="#3C2F2F",
+                                ),
+                                ft.Text(
+                                    f"{item.get('weather', '')}  {item.get('bgm_name', '')}".strip(),
+                                    size=11,
+                                    color="#8C7A6B",
+                                ),
+                            ],
+                            spacing=2,
+                            expand=True,
+                        ),
+                        ft.Button(
+                            content="열기",
+                            on_click=lambda e, ent=item: load_entry_into_form(ent),
+                            bgcolor="#EBE3D9",
+                            color="#3C2F2F",
+                        ),
+                        ft.Button(
+                            content="삭제",
+                            on_click=lambda e, dt=d_str: delete_entry_by_date(dt),
+                            bgcolor="#F5E1DF",
+                            color="#9E4747",
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                bgcolor="#FFFDF9",
+                border=ft.Border.all(1, "#E2D9CE"),
+                border_radius=ft.BorderRadius.all(8),
+                padding=10,
+            )
+            saved_list_column.controls.append(row_card)
+
+    # DB 저장 버튼
     def save_diary(e):
-        d_val = diary_input.current.value.strip()
-        r_val = raw_input.current.value.strip()
+        d_val = (diary_field.value or "").strip()
+        r_val = (raw_field.value or "").strip()
         if not d_val and not r_val:
-            show_msg("저장할 일기 내용이 없습니다.")
+            show_msg("저장할 일기 내용이 없습니다. 먼저 일기를 작성해 주세요!")
             return
 
         final_content = d_val if d_val else r_val
-        date_val = current_date.current.value.strip() or today_str
-        weather_val = current_weather.current.value
-        kw_val = current_keywords.current.value.strip() or extract_keywords(final_content)
-        current_keywords.current.value = kw_val
-        p_val = photo_path.current.value or ""
-        b_val = bgm_title.current.value or ""
+        date_val = (date_field.value or "").strip() or today_str
+        weather_val = weather_dropdown.value or "☀️ 맑음"
+        kw_val = (keywords_field.value or "").strip() or extract_keywords(r_val or final_content)
+        keywords_field.value = kw_val
+        p_val = current_photo_path["value"]
+        b_val = bgm_title_text.value if bgm_title_text.value != "선곡된 BGM 없음" else ""
 
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO diaries (date, weather, keywords, raw_speech, diary, photo_path, bgm_name, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(date) DO UPDATE SET
-                    weather = excluded.weather,
-                    keywords = excluded.keywords,
-                    raw_speech = excluded.raw_speech,
-                    diary = excluded.diary,
-                    photo_path = excluded.photo_path,
-                    bgm_name = excluded.bgm_name,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (date_val, weather_val, kw_val, r_val, final_content, p_val, b_val),
-            )
-            conn.commit()
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO diaries (date, weather, keywords, raw_speech, diary, photo_path, bgm_name, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(date) DO UPDATE SET
+                        weather = excluded.weather,
+                        keywords = excluded.keywords,
+                        raw_speech = excluded.raw_speech,
+                        diary = excluded.diary,
+                        photo_path = excluded.photo_path,
+                        bgm_name = excluded.bgm_name,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (date_val, weather_val, kw_val, r_val, final_content, p_val, b_val),
+                )
+                conn.commit()
+        except Exception as ex:
+            show_msg(f"DB 저장 오류: {ex}")
+            return
 
-        show_msg(f"'{date_val}' 일기가 DB에 저장되었습니다 ✅")
+        refresh_saved_list()
         render_calendar()
-        page.update()
+        show_msg(f"'{date_val}' 일기가 저장되었습니다 ✅ (목록 및 캘린더 반영 완료)")
 
     # 예시 문장 넣기
     def put_sample(e):
-        raw_input.current.value = (
+        raw_field.value = (
             "오늘 수업시간에 파이썬으로 보이스 일기장 앱을 완성했어 "
             "점심에는 학식 돈까스를 먹었는데 정말 맛있었고 오후에는 도서관에서 공부하다가 "
             "저녁에 공원 산책을 다녀왔어 알차고 뿌듯한 하루였어"
         )
-        page.update()
+        show_msg("예시 문장이 입력되었습니다 · [일기 생성]을 눌러보세요")
 
-    # 캘린더 렌더링 함수
+    # 캘린더 렌더링
     def render_calendar():
-        cal_title.value = f"{cal_year}년 {cal_month}월"
+        y, m = cal_state["year"], cal_state["month"]
+        cal_title.value = f"{y}년 {m}월"
         cal_grid_column.controls.clear()
 
-        # DB에서 해당 월 일기 조회
         month_events = {}
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("SELECT date, weather, keywords, diary FROM diaries")
-            for row in cur.fetchall():
-                month_events[row["date"].replace("-", ".")] = dict(row)
+        for entry in load_all_entries():
+            norm_date = entry["date"].replace("-", ".").strip()
+            month_events[norm_date] = entry
 
         c = calendar.Calendar(firstweekday=6)
-        weeks = c.monthdayscalendar(cal_year, cal_month)
+        weeks = c.monthdayscalendar(y, m)
 
         for week in weeks:
             row_controls = []
             for d in week:
                 if d == 0:
-                    row_controls.append(ft.Container(expand=1))
+                    row_controls.append(ft.Container(expand=1, height=70))
                 else:
-                    d_key = f"{cal_year}.{cal_month:02d}.{d:02d}"
+                    d_key = f"{y}.{m:02d}.{d:02d}"
                     has_entry = d_key in month_events
                     entry_kw = month_events[d_key]["keywords"] if has_entry else ""
 
-                    def open_entry(e, target_date=d_key):
-                        current_date.current.value = target_date
+                    def on_cell_tap(e, target_date=d_key):
                         if target_date in month_events:
-                            item = month_events[target_date]
-                            current_weather.current.value = item["weather"] or "☀️ 맑음"
-                            current_keywords.current.value = item["keywords"] or ""
-                            diary_input.current.value = item["diary"] or ""
-                        tabs.selected_index = 0
-                        page.update()
+                            load_entry_into_form(month_events[target_date])
+                        else:
+                            reset_form()
+                            date_field.value = target_date
+                            switch_to_diary()
+                            show_msg(f"'{target_date}' 새 일기를 작성합니다")
 
                     cell = ft.Container(
                         content=ft.Column(
                             [
-                                ft.Text(str(d), size=12, weight=ft.FontWeight.BOLD, color="#3C2F2F"),
+                                ft.Text(
+                                    str(d),
+                                    size=12,
+                                    weight=ft.FontWeight.BOLD,
+                                    color="#3C2F2F",
+                                ),
                                 ft.Text(
                                     entry_kw,
                                     size=10,
-                                    color="#8D6E63",
+                                    color="#795548",
                                     max_lines=2,
                                     overflow=ft.TextOverflow.ELLIPSIS,
                                     weight=ft.FontWeight.W_500,
-                                ) if has_entry else ft.Container(),
+                                )
+                                if has_entry
+                                else ft.Container(),
                             ],
                             spacing=2,
                         ),
                         expand=1,
-                        height=68,
-                        bgcolor="#FFFDF9" if not has_entry else "#FCE7D2",
-                        border=ft.border.all(1, "#E2D9CE"),
-                        border_radius=8,
+                        height=70,
+                        bgcolor="#FCE7D2" if has_entry else "#FFFDF9",
+                        border=ft.Border.all(1, "#E2D9CE"),
+                        border_radius=ft.BorderRadius.all(8),
                         padding=4,
-                        on_click=open_entry,
+                        on_click=on_cell_tap,
                     )
                     row_controls.append(cell)
-            cal_grid_column.controls.append(ft.Row(row_controls, spacing=4))
+            cal_grid_column.controls.append(ft.Row(controls=row_controls, spacing=4))
+
+    def prev_month(e):
+        if cal_state["month"] == 1:
+            cal_state["month"] = 12
+            cal_state["year"] -= 1
+        else:
+            cal_state["month"] -= 1
+        render_calendar()
         page.update()
 
-    # 캘린더 월 이동
-    def prev_month(e):
-        nonlocal cal_year, cal_month
-        if cal_month == 1:
-            cal_month = 12
-            cal_year -= 1
-        else:
-            cal_month -= 1
-        render_calendar()
-
     def next_month(e):
-        nonlocal cal_year, cal_month
-        if cal_month == 12:
-            cal_month = 1
-            cal_year += 1
+        if cal_state["month"] == 12:
+            cal_state["month"] = 1
+            cal_state["year"] += 1
         else:
-            cal_month += 1
+            cal_state["month"] += 1
         render_calendar()
+        page.update()
 
-    # 1. 일기장 뷰 화면 UI
-    diary_view = ft.ListView(
-        expand=True,
-        spacing=12,
+    # [📖 일기장] / [📅 캘린더] 화면 전환 버튼 및 컨테이너
+    diary_section = ft.Column(
+        visible=True,
+        spacing=10,
         controls=[
             ft.Row(
                 [
-                    ft.TextField(
-                        ref=current_date,
-                        label="날짜",
-                        value=today_str,
-                        width=140,
-                        dense=True,
-                        bgcolor="#FFFDF9",
-                    ),
-                    ft.Dropdown(
-                        ref=current_weather,
-                        label="날씨",
-                        value="☀️ 맑음",
-                        options=[
-                            ft.dropdown.Option("☀️ 맑음"),
-                            ft.dropdown.Option("⛅ 구름"),
-                            ft.dropdown.Option("☁️ 흐림"),
-                            ft.dropdown.Option("🌧️ 비"),
-                            ft.dropdown.Option("❄️ 눈"),
-                        ],
-                        width=110,
-                        dense=True,
-                        bgcolor="#FFFDF9",
-                    ),
-                    ft.ElevatedButton(
-                        "💾 저장",
-                        icon=ft.Icons.SAVE,
+                    date_field,
+                    weather_dropdown,
+                    ft.Button(
+                        content="💾 일기 저장",
                         on_click=save_diary,
                         bgcolor="#3C2F2F",
                         color="#FFFFFF",
                     ),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                wrap=True,
             ),
-            ft.TextField(
-                ref=current_keywords,
-                label="핵심 키워드",
-                hint_text="자동 추출 또는 직접 입력",
-                dense=True,
-                bgcolor="#FFFDF9",
+            keywords_field,
+            ft.Text(
+                "🎙️ 오늘 있었던 일 말하기 / 적기",
+                size=13,
+                weight=ft.FontWeight.BOLD,
+                color="#3C2F2F",
             ),
-            ft.Text("🎙️ 오늘 있었던 일 (말하거나 입력)", size=13, weight=ft.FontWeight.BOLD, color="#3C2F2F"),
-            ft.TextField(
-                ref=raw_input,
-                hint_text="오늘 있었던 일을 편하게 적어보세요...",
-                multiline=True,
-                min_lines=3,
-                max_lines=4,
-                bgcolor="#FFFDF9",
-            ),
+            raw_field,
             ft.Row(
                 [
-                    ft.OutlinedButton("예시 넣기", on_click=put_sample),
-                    ft.ElevatedButton(
-                        "🪄 일기 생성",
+                    ft.Button(
+                        content="+ 새 일기",
+                        on_click=reset_form,
+                        bgcolor="#EBE3D9",
+                        color="#3C2F2F",
+                    ),
+                    ft.Button(
+                        content="예시 넣기",
+                        on_click=put_sample,
+                        bgcolor="#EBE3D9",
+                        color="#4A3F35",
+                    ),
+                    ft.Button(
+                        content="일기 생성",
                         on_click=generate_diary,
                         bgcolor="#8D6E63",
                         color="#FFFFFF",
                     ),
                 ],
                 alignment=ft.MainAxisAlignment.END,
+                spacing=6,
             ),
             ft.Divider(color="#E2D9CE"),
             ft.Row(
                 [
-                    ft.ElevatedButton(
-                        "📷 사진 첨부",
-                        icon=ft.Icons.PHOTO,
-                        on_click=lambda _: file_picker.pick_files(allow_multiple=False),
+                    ft.Button(
+                        content="📷 사진 첨부",
+                        on_click=pick_photo,
                         bgcolor="#EBE3D9",
                         color="#3C2F2F",
                     ),
-                    ft.ElevatedButton(
-                        "🎵 BGM 선택",
-                        icon=ft.Icons.MUSIC_NOTE,
-                        on_click=lambda _: bgm_picker.pick_files(allow_multiple=False),
+                    ft.Button(
+                        content="사진 제거",
+                        on_click=clear_photo,
+                        bgcolor="#FAF6F0",
+                        color="#8C7A6B",
+                    ),
+                    ft.Button(
+                        content="🎵 BGM 선곡",
+                        on_click=pick_bgm,
                         bgcolor="#EBE3D9",
                         color="#3C2F2F",
                     ),
                 ],
-                spacing=8,
+                spacing=6,
+                wrap=True,
             ),
-            ft.Text(ref=photo_path, visible=False),
-            ft.Image(ref=photo_image, width=200, height=130, fit=ft.ImageFit.COVER, visible=False, border_radius=8),
-            ft.Text(ref=bgm_title, value="선곡된 BGM 없음", size=12, color="#8C7A6B"),
-            ft.Text("📖 완성된 일기장", size=13, weight=ft.FontWeight.BOLD, color="#3C2F2F"),
-            ft.TextField(
-                ref=diary_input,
-                multiline=True,
-                min_lines=6,
-                max_lines=10,
-                bgcolor="#FDFBF7",
+            photo_preview,
+            ft.Row([photo_name_text, ft.Text(" | ", color="#E2D9CE"), bgm_title_text]),
+            ft.Text(
+                "📖 오늘의 일기장",
+                size=13,
+                weight=ft.FontWeight.BOLD,
+                color="#3C2F2F",
             ),
+            diary_field,
+            ft.Divider(color="#E2D9CE"),
+            ft.Text(
+                "🔖 저장된 일기 목록 (날짜 | 키워드)",
+                size=13,
+                weight=ft.FontWeight.BOLD,
+                color="#3C2F2F",
+            ),
+            saved_list_column,
         ],
     )
 
-    # 2. 캘린더 뷰 화면 UI
-    calendar_view = ft.Column(
-        expand=True,
+    calendar_section = ft.Column(
+        visible=False,
         spacing=8,
         controls=[
-            ft.Row(
-                [
-                    ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=prev_month),
-                    cal_title,
-                    ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=next_month),
-                ],
-                alignment=ft.MainAxisAlignment.CENTER,
+            ft.Text(
+                "날짜를 터치하면 해당 일기를 보거나 새로 작성할 수 있습니다.",
+                size=12,
+                color="#8C7A6B",
             ),
             ft.Row(
                 [
-                    ft.Container(ft.Text("일", color="#C0392B", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
-                    ft.Container(ft.Text("월", color="#3C2F2F", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
-                    ft.Container(ft.Text("화", color="#3C2F2F", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
-                    ft.Container(ft.Text("수", color="#3C2F2F", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
-                    ft.Container(ft.Text("목", color="#3C2F2F", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
-                    ft.Container(ft.Text("금", color="#3C2F2F", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
-                    ft.Container(ft.Text("토", color="#2980B9", weight=ft.FontWeight.BOLD), expand=1, alignment=ft.alignment.center),
+                    ft.Button(
+                        content="◀ 이전 달",
+                        on_click=prev_month,
+                        bgcolor="#EBE3D9",
+                        color="#3C2F2F",
+                    ),
+                    cal_title,
+                    ft.Button(
+                        content="다음 달 ▶",
+                        on_click=next_month,
+                        bgcolor="#EBE3D9",
+                        color="#3C2F2F",
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            ft.Row(
+                [
+                    ft.Container(
+                        content=ft.Text("일", color="#C0392B", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Container(
+                        content=ft.Text("월", color="#3C2F2F", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Container(
+                        content=ft.Text("화", color="#3C2F2F", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Container(
+                        content=ft.Text("수", color="#3C2F2F", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Container(
+                        content=ft.Text("목", color="#3C2F2F", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Container(
+                        content=ft.Text("금", color="#3C2F2F", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Container(
+                        content=ft.Text("토", color="#2980B9", weight=ft.FontWeight.BOLD),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    ),
                 ]
             ),
             cal_grid_column,
         ],
     )
 
-    # 메인 네비게이션 탭 바
-    tabs = ft.Tabs(
-        selected_index=0,
-        animation_duration=200,
-        tabs=[
-            ft.Tab(text="일기장", icon=ft.Icons.BOOK, content=diary_view),
-            ft.Tab(text="캘린더", icon=ft.Icons.CALENDAR_MONTH, content=calendar_view),
-        ],
+    btn_tab_diary = ft.Button(
+        content="📖 일기장",
+        bgcolor="#8D6E63",
+        color="#FFFFFF",
+        expand=True,
+    )
+    btn_tab_calendar = ft.Button(
+        content="📅 캘린더",
+        bgcolor="#EBE3D9",
+        color="#3C2F2F",
         expand=True,
     )
 
-    page.add(tabs)
+    def switch_to_diary(e=None):
+        diary_section.visible = True
+        calendar_section.visible = False
+        btn_tab_diary.bgcolor = "#8D6E63"
+        btn_tab_diary.color = "#FFFFFF"
+        btn_tab_calendar.bgcolor = "#EBE3D9"
+        btn_tab_calendar.color = "#3C2F2F"
+        page.update()
+
+    def switch_to_calendar(e=None):
+        diary_section.visible = False
+        calendar_section.visible = True
+        btn_tab_calendar.bgcolor = "#8D6E63"
+        btn_tab_calendar.color = "#FFFFFF"
+        btn_tab_diary.bgcolor = "#EBE3D9"
+        btn_tab_diary.color = "#3C2F2F"
+        render_calendar()
+        page.update()
+
+    btn_tab_diary.on_click = switch_to_diary
+    btn_tab_calendar.on_click = switch_to_calendar
+
+    # 상단 헤더 및 네비게이션 버튼 추가
+    page.add(
+        ft.Column(
+            spacing=10,
+            controls=[
+                ft.Text(
+                    "나의 하루 기록장",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                    color="#3C2F2F",
+                ),
+                status_banner,
+                ft.Row([btn_tab_diary, btn_tab_calendar], spacing=8),
+                ft.Divider(color="#E2D9CE"),
+                diary_section,
+                calendar_section,
+            ],
+        )
+    )
+
+    refresh_saved_list()
     render_calendar()
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    # Flet 1.0+ (ft.run) 및 이전 버전 호환 실행
+    if hasattr(ft, "run"):
+        ft.run(main)
+    else:
+        ft.app(target=main)
