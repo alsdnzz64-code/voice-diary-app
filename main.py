@@ -118,9 +118,8 @@ def polish_spoken_to_diary(raw: str) -> str:
 def main(page: ft.Page):
     page.title = "나의 하루 기록장"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.padding = 16
+    page.padding = 0
     page.bgcolor = "#F4EFEA"
-    page.scroll = ft.ScrollMode.AUTO
 
     init_db()
 
@@ -591,6 +590,8 @@ def main(page: ft.Page):
                 color="#3C2F2F",
             ),
             saved_list_column,
+            # 갤럭시 하단 내비게이션 바(홈/뒤로가기 버튼)와 겹치지 않도록 여유 공간 확보
+            ft.Container(height=40),
         ],
     )
 
@@ -661,6 +662,7 @@ def main(page: ft.Page):
                 ]
             ),
             cal_grid_column,
+            ft.Container(height=40),
         ],
     )
 
@@ -699,23 +701,32 @@ def main(page: ft.Page):
     btn_tab_diary.on_click = switch_to_diary
     btn_tab_calendar.on_click = switch_to_calendar
 
-    # 상단 헤더 및 네비게이션 버튼 추가
+    # SafeArea로 감싸서 갤럭시 상단 상태바 및 하단 홈버튼(내비게이션 바) 영역 침범 방지
     page.add(
-        ft.Column(
-            spacing=10,
-            controls=[
-                ft.Text(
-                    "나의 하루 기록장",
-                    size=20,
-                    weight=ft.FontWeight.BOLD,
-                    color="#3C2F2F",
+        ft.SafeArea(
+            expand=True,
+            content=ft.Container(
+                padding=ft.Padding.only(left=16, top=10, right=16, bottom=24),
+                expand=True,
+                content=ft.Column(
+                    scroll=ft.ScrollMode.AUTO,
+                    expand=True,
+                    spacing=10,
+                    controls=[
+                        ft.Text(
+                            "나의 하루 기록장",
+                            size=20,
+                            weight=ft.FontWeight.BOLD,
+                            color="#3C2F2F",
+                        ),
+                        status_banner,
+                        ft.Row([btn_tab_diary, btn_tab_calendar], spacing=8),
+                        ft.Divider(color="#E2D9CE"),
+                        diary_section,
+                        calendar_section,
+                    ],
                 ),
-                status_banner,
-                ft.Row([btn_tab_diary, btn_tab_calendar], spacing=8),
-                ft.Divider(color="#E2D9CE"),
-                diary_section,
-                calendar_section,
-            ],
+            ),
         )
     )
 
@@ -724,7 +735,6 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    # Flet 1.0+ (ft.run) 및 이전 버전 호환 실행
     if hasattr(ft, "run"):
         ft.run(main)
     else:
